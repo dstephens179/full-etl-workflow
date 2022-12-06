@@ -1,0 +1,442 @@
+---
+title: "Web Scraping & ETL Workflow"
+---
+
+# LIBRARIES
+```{r setup, include=FALSE}
+library(DataExplorer)
+library(tidyverse)
+library(timetk)
+library(lubridate)
+library(bigrquery)
+library(googlesheets4)
+library(httr)
+library(rvest)
+library(plotly)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# 1.0 SCRAPING
+```{r}
+# Set dates ----
+dates <- data.frame(seq(as.Date("2015-07-01"), Sys.Date()-1, by = "days"))
+names(dates)[1] <- 'date'
+
+start_date <- "2015-07-01"
+```
+
+
+
+## Local Data
+```{r}
+# clean historical data
+hist_mxn <- read_csv("C:\\Users\\nidst\\Desktop\\GitHub\\etl_framework\\historical_MXN_USD\\2015-2022-06-30.csv", 
+                     col_select = c(1, 5), col_types = list(col_date(), col_integer())) %>%
+              rename(date     = Date,
+                     hist_mxn = Close) %>%
+              filter(date >= start_date)
+
+hist_mxn <- hist_mxn[!grepl("null", hist_mxn$hist_mxn), ]
+
+hist_mxn$hist_mxn <- as.numeric(hist_mxn$hist_mxn)
+```
+
+
+
+## Scrape Gold Price
+```{r}
+# web scrape all gold price data -- USD per oz.
+scrape <- function(year){
+  
+  url <- paste("https://www.usagold.com/daily-gold-price-history/?ddYears=", year, sep = "")
+  
+  cat("Scraping url: ", url, "\n")
+  
+  df <- read_html(url) %>%
+    html_nodes("#pricehistorytable") %>%
+    html_table
+  
+  return(df)
+  
+  Sys.sleep(1)  # pauses for 1 second.
+  
+}
+
+
+
+# * Scrape gold, reformat & clean ----
+gold_price <- map_df(seq(2015, 2022), scrape)
+gold_price <- mutate(gold_price, date = readr::parse_date(date, "%d %b %Y"))
+gold_price <- gold_price[rev(order(gold_price$date)),] %>%
+                na.omit(gold_price)
+
+
+
+# * Left join and fill NA's ----
+gold_price <- left_join(dates,
+                        gold_price,
+                        by = "date") %>% 
+              fill(`Closing Price`) %>%
+              rename(gold_usd_oz = 'Closing Price')
+```
+
+
+
+## Scrape USD/MXN Exchange Rates
+```{r}
+# * Scrape current USD/MXN data ----
+
+page <- "https://finance.yahoo.com/quote/USDMXN%3DX/history?period1=1070064000&period2=1800000000&interval=1d&filter=history&frequency=1d&includeAdjustedClose=true"
+
+current_mxn <- as.data.frame(
+  read_html(page) %>%
+  html_nodes("table") %>%
+  html_table
+  )
+
+
+# * Clean up data ----
+current_mxn <- mutate(current_mxn, 
+                      date = parse_date(Date, "%b %d, %Y"), 
+                      mxn = parse_double(Close.))
+```
+
+
+## Join
+```{r}
+# * Left join and fill NA's ----
+gold_mxn <- left_join(gold_price, hist_mxn, by = 'date') %>%
+              left_join(., current_mxn %>% select(date, mxn), by = 'date')
+
+
+# if mxn column is NA, replace with hist_mxn, otherwise keep mxn.
+gold_mxn$mxn <- ifelse(is.na(gold_mxn$mxn), gold_mxn$hist_mxn, gold_mxn$mxn)
+
+
+# fill all NA's with previous date's price, add mxn_per_gram column, and drop hist_mxn column
+gold_mxn <- gold_mxn %>% fill(mxn)
+gold_mxn$mxn_per_gram <- ((gold_mxn$gold_usd_oz * 0.0321507) * gold_mxn$mxn)
+gold_mxn = select(gold_mxn, -hist_mxn) 
+
+
+# remove duplicate dates from overlapping years
+gold_mxn <- gold_mxn[!duplicated(gold_mxn$date), ]
+
+```
+
+
+## Visualize
+```{r}
+
+# Gold Price per Gram in MXN
+g_gold <- ggplot(gold_mxn, 
+                 aes(x = date, 
+                     y = mxn_per_gram))+
+  geom_line() +
+  ggtitle("Daily Gold Price per Gram (MXN)") +
+  xlab("Date") +
+  ylab("MXN per Gram")
+
+ggplotly(g_gold)
+
+ggsave(g_gold, filename = "C:\\Users\\nidst\\Desktop\\GitHub\\etl_framework\\graphs\\daily_gold_price_per_gram.png")
+
+
+
+
+# USD in MXN chart
+g_mxn <- ggplot(gold_mxn, 
+                aes(x = date,
+                    y = mxn))+
+  geom_line() +
+  ggtitle("USD/MXN Exchange Rate") +
+  xlab("Date") +
+  ylab("USD/MXN Exchange Rate")
+
+ggplotly(g_mxn)
+
+ggsave(g_mxn, filename = "C:\\Users\\nidst\\Desktop\\GitHub\\etl_framework\\graphs\\usd_mxn_exchange_rate.png")
+```
+
+
+
+## Upload to BigQuery
+```{r}
+# UPLOAD ----
+# upload web-scraped data to bigquery.
+
+datasetid <- "source-data-314320.joyeria_dataset.gold_price"
+
+# use bigrquery to create (if needed), upload and overwrite the dataset
+bq_perform_upload(datasetid,
+                  gold_mxn,
+                  nskip = 0,
+                  source_format = "CSV",
+                  create_disposition = "CREATE_IF_NEEDED",
+                  write_disposition = "WRITE_TRUNCATE")
+```
+
+
+
+
+# 2.0 ETL WORKFLOW
+
+## Set GSheet id's
+```{r}
+centro_id   <- Sys.getenv("centro_id")
+segovia_id  <- Sys.getenv("segovia_id")
+patria_id   <- Sys.getenv("patria_id")
+pasaje_id   <- Sys.getenv("pasaje_id")
+vallardo_id <- Sys.getenv("vallardo_id")
+va_id       <- Sys.getenv("va_id")
+
+gs4_auth("david@miriamjoyeria.com")
+```
+
+
+
+## Pull Historical Data
+```{r}
+
+# filter to separate from bigquery historical data and what is taken from google sheets
+date_filter <- '2022-09-01'
+today <- today()
+
+
+projectid = "source-data-314320"
+sql <- "SELECT *
+        FROM `source-data-314320.Store_Data.All_Data`
+        ORDER BY Date desc
+"
+
+
+# Run the query and store
+bq_query <- bq_project_query(projectid, sql)
+data_tbl <- bq_table_download(bq_query)
+
+
+# save as csv at end of month
+write_csv(data_tbl, str_glue("historical_store_data/All_Data_until_{today}.csv"))
+csv_tbl <- read.csv(str_glue("historical_store_data/All_Data_until_{today}.csv"))
+```
+
+
+## Split historical & forecast
+```{r}
+data_historical_tbl   <- data_tbl %>% 
+                            filter(sales != 0) %>%
+                            filter(is.na(forecast)) %>%
+                            filter(date < date_filter) %>%
+                            select(-gold_usd_oz, -mxn, -mxn_per_gram)
+
+data_forecast_tbl            <- read_rds("../forecasting_framework/00_models/best_forecast_models_tbl.rds")
+data_forecast_inventario_tbl <- read_rds("../forecasting_framework/00_models/best_forecast_valdivia_inventario.rds")
+
+```
+
+
+
+## Pull Current Data from GSheets
+```{r}
+
+# Set select_filter
+select_filter <- c('tienda', 'may_men', 'date', 
+                   'owner', 'metal_type', 'linea', 
+                   'product_type', 'sales', 'forecast', 
+                   'inventario', 'nombre_cliente', 'nombre_agente')
+
+
+# Centro
+centro_prepared_tbl <- read_sheet(ss = centro_id, 
+                                  sheet = "Sales Data", 
+                                  .name_repair = make.names) %>%
+  mutate(tienda              = 'Centro', 
+         may_men             = MAY.MEN,
+         date                = ymd(Date), 
+         owner               = Owner, 
+         metal_type          = Metal.type,
+         linea               = NA,
+         product_type        = Product.Type, 
+         sales               = Sales,
+         forecast            = NA,
+         inventario          = INVENTARIO,
+         forecast_inventario = NA,
+         nombre_cliente      = NOMBRE.CLIENTE,
+         nombre_agente       = NOMBRE.AGENTE) %>%
+  select(select_filter) %>%
+  filter(date >= date_filter)
+
+
+
+# Segovia
+segovia_prepared_tbl <- read_sheet(ss = segovia_id, 
+                                   sheet = "Sales Data", 
+                                   .name_repair = make.names) %>%
+  mutate(tienda              = 'Segovia', 
+         may_men             = MAY.MEN,
+         date                = ymd(Date), 
+         owner               = Owner, 
+         metal_type          = Metal.type,
+         linea               = Linea.Alineada,
+         product_type        = Product.Type, 
+         sales               = Sales,
+         forecast            = NA,
+         inventario          = INVENTARIO,
+         forecast_inventario = NA, 
+         nombre_cliente      = NOMBRE.CLIENTE,
+         nombre_agente       = NOMBRE.AGENTE) %>%
+  select(select_filter) %>%
+  filter(date >= date_filter)
+
+
+
+# Pl.Patria
+patria_prepared_tbl <- read_sheet(ss = patria_id, 
+                                  sheet = "Sales Data", 
+                                  .name_repair = make.names) %>%
+  mutate(tienda              = 'Pl.Patria', 
+         may_men             = MAY.MEN,
+         date                = ymd(Date), 
+         owner               = Owner, 
+         metal_type          = Metal.type,
+         linea               = NA,
+         product_type        = Product.Type, 
+         sales               = Sales,
+         forecast            = NA,
+         inventario          = INVENTARIO,
+         forecast_inventario = NA,
+         nombre_cliente      = NOMBRE.CLIENTE,
+         nombre_agente       = NOMBRE.AGENTE) %>%
+  select(select_filter) %>%
+  filter(date >= date_filter)
+
+
+
+# Pasaje
+pasaje_prepared_tbl <- read_sheet(ss = pasaje_id, 
+                                  sheet = "Sales Data", 
+                                  .name_repair = make.names) %>%
+  mutate(tienda              = 'Pasaje',
+         may_men             = MAY.MEN,
+         date                = ymd(FECHA), 
+         owner               = Owner, 
+         metal_type          = Metal.type,
+         linea               = Linea.Alineada,
+         product_type        = Product.Type, 
+         sales               = IMPORTE,
+         forecast            = NA,
+         inventario          = INVENTARIO,
+         forecast_inventario = NA,
+         nombre_cliente      = NOMBRE.CLIENTE,
+         nombre_agente       = NOMBRE.AGENTE) %>%
+  select(select_filter) %>%
+  filter(date >= date_filter)
+
+
+
+# Vallardo
+vallardo_prepared_tbl <- read_sheet(ss = vallardo_id, 
+                                    sheet = "Sales Data", 
+                                    .name_repair = make.names) %>%
+  mutate(tienda              = 'Vallardo',
+         may_men             = MAY.MEN,
+         date                = ymd(FECHA), 
+         owner               = 'Jorge', 
+         metal_type          = Metal.type,
+         linea               = NA,
+         product_type        = Product.Type, 
+         sales               = IMPORTE,
+         forecast            = NA,
+         inventario          = INVENTARIO,
+         forecast_inventario = NA,
+         nombre_cliente      = NOMBRE.CLIENTE,
+         nombre_agente       = NOMBRE.AGENTE) %>%
+  select(select_filter) %>%
+  filter(date >= date_filter)
+
+
+
+# VA
+va_prepared_tbl <- read_sheet(ss = va_id, 
+                              sheet = "Sales Data", 
+                              .name_repair = make.names) %>%
+  mutate(tienda              = Tienda,
+         may_men             = MAY.MEN,
+         date                = ymd(Date), 
+         owner               = Owner,
+         metal_type          = Metal.Type,
+         linea               = Linea.Alineada,
+         product_type        = Product.Type, 
+         sales               = IMPORTE,
+         forecast            = NA,
+         inventario          = Piezas,
+         forecast_inventario = NA,
+         nombre_cliente      = Nombre.Cliente,
+         nombre_agente       = Nombre.Agente) %>%
+  select(select_filter) %>%
+  filter(date >= date_filter)
+```
+
+
+## Append & Join
+```{r}
+
+appended_sales_tbl <- bind_rows(data_historical_tbl,
+                                data_forecast_tbl,
+                                data_forecast_inventario_tbl,
+                                centro_prepared_tbl,
+                                segovia_prepared_tbl,
+                                patria_prepared_tbl,
+                                pasaje_prepared_tbl,
+                                vallardo_prepared_tbl,
+                                va_prepared_tbl)
+
+
+
+# left join gold & mxn
+full_dataset_tbl <- appended_sales_tbl %>%
+                      left_join(.,
+                                y = gold_mxn, 
+                                by = "date")
+
+```
+
+
+## Upload to BigQuery
+```{r}
+write_rds(full_dataset_tbl, str_glue("00_data/full_dataset_tbl_{today}.rds"))
+
+
+# Development or Production
+datasetid <- "source-data-314320.Store_Data.All_Data"
+# datasetid <- "source-data-314320.Store_Data.dev_all_data"
+
+
+
+bq_perform_upload(datasetid,
+                  full_dataset_tbl,
+                  fields = list(bq_field(name = "tienda", type = "string"),
+                                bq_field(name = "may_men", type = "string"),
+                                bq_field(name = "date", type = "date"),
+                                bq_field(name = "owner", type = "string"),
+                                bq_field(name = "metal_type", type = "string"),
+                                bq_field(name = "linea", type = "string"),
+                                bq_field(name = "product_type", type = "string"),
+                                bq_field(name = "sales", type = "float"),
+                                bq_field(name = "forecast", type = "float"),
+                                bq_field(name = "inventario", type = "float"),
+                                bq_field(name = "forecast_inventario", type = "float"),
+                                bq_field(name = "nombre_cliente", type = "string"),
+                                bq_field(name = "nombre_agente", type = "string"),
+                                bq_field(name = "gold_usd_oz", type = "float"),
+                                bq_field(name = "mxn", type = "float"),
+                                bq_field(name = "mxn_per_gram", type = "float")),
+                  nskip = 0,
+                  source_format = "CSV",
+                  create_disposition = "CREATE_IF_NEEDED",
+                  write_disposition = "WRITE_TRUNCATE")
+```
+
+
